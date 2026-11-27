@@ -1,0 +1,213 @@
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <dirent.h>
+#include <sys/statvfs.h>
+#include <sys/utsname.h>
+
+namespace {
+
+std::string trim(const std::string& text)
+{
+    const char* whitespace = " \t\r\n";
+    const std::string::size_type begin = text.find_first_not_of(whitespace);
+    if (begin == std::string::npos)
+    {
+        return "";
+    }
+
+    const std::string::size_type end = text.find_last_not_of(whitespace);
+    return text.substr(begin, end - begin + 1);
+}
+
+std::string readValueFromFile(const std::string& path,
+                              const std::string& key,
+                              char separatorCharacter = ':')
+{
+    std::ifstream file(path);
+    if (!file)
+    {
+        return "";
+    }
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        const std::string::size_type separator = line.find(separatorCharacter);
+        if (separator == std::string::npos)
+        {
+            continue;
+        }
+
+        if (trim(line.substr(0, separator)) == key)
+        {
+            return trim(line.substr(separator + 1));
+        }
+    }
+
+    return "";
+}
+
+std::string unquote(const std::string& text)
+{
+    if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
+    {
+        return text.substr(1, text.size() - 2);
+    }
+    return text;
+}
+
+unsigned long long parseKilobytes(const std::string& value)
+{
+    std::istringstream stream(value);
+    unsigned long long kilobytes = 0;
+    stream >> kilobytes;
+    return kilobytes * 1024ULL;
+}
+
+std::string humanReadable(unsigned long long bytes)
+{
+    static const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+
+    double value = static_cast<double>(bytes);
+    std::size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < sizeof(units) / sizeof(units[0]))
+    {
+        value /= 1024.0;
+        ++unit;
+    }
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(unit == 0 ? 0 : 2)
+           << value << ' ' << units[unit];
+    return output.str();
+}
+
+void showCpu()
+{
+    std::cout << "CPU: "
+              << readValueFromFile("/proc/cpuinfo", "model name") << '\n';
+}
+
+void showMemory()
+{
+    const std::string total = readValueFromFile("/proc/meminfo", "MemTotal");
+    const std::string available = readValueFromFile("/proc/meminfo", "MemAvailable");
+    const std::string freeMemory = readValueFromFile("/proc/meminfo", "MemFree");
+
+    std::cout << "Memory total:     " << humanReadable(parseKilobytes(total)) << '\n';
+    std::cout << "Memory available: " << humanReadable(parseKilobytes(available)) << '\n';
+    std::cout << "Memory free:      " << humanReadable(parseKilobytes(freeMemory)) << '\n';
+}
+
+void showOperatingSystem()
+{
+    utsname info{};
+    const bool hasUname = (uname(&info) == 0);
+
+    std::string name = unquote(readValueFromFile("/etc/os-release", "PRETTY_NAME", '='));
+    std::string version = unquote(readValueFromFile("/etc/os-release", "VERSION_ID", '='));
+
+    if (name.empty() && hasUname)
+    {
+        name = info.sysname;
+    }
+    if (version.empty() && hasUname)
+    {
+        version = info.release;
+    }
+
+    std::cout << "OS: " << (name.empty() ? "Unknown" : name);
+    if (!version.empty())
+    {
+        std::cout << " (version " << version << ')';
+    }
+    std::cout << '\n';
+
+    if (hasUname)
+    {
+        std::cout << "Kernel: " << info.sysname << ' ' << info.release << '\n';
+        std::cout << "Architecture: " << info.machine << '\n';
+    }
+}
+
+void showStorage(const std::string& path)
+{
+    struct statvfs usage{};
+    if (statvfs(path.c_str(), &usage) != 0)
+    {
+        std::cerr << "Cannot read storage information for " << path << '\n';
+        return;
+    }
+
+    const unsigned long long total =
+        static_cast<unsigned long long>(usage.f_blocks) * usage.f_frsize;
+    const unsigned long long freeSpace =
+        static_cast<unsigned long long>(usage.f_bfree) * usage.f_frsize;
+    const unsigned long long available =
+        static_cast<unsigned long long>(usage.f_bavail) * usage.f_frsize;
+
+    std::cout << "Storage (" << path << "):\n";
+    std::cout << "  Total:     " << humanReadable(total) << '\n';
+    std::cout << "  Free:      " << humanReadable(freeSpace) << '\n';
+    std::cout << "  Available: " << humanReadable(available) << '\n';
+}
+
+void showProcesses()
+{
+    DIR* directory = opendir("/proc");
+    if (directory == nullptr)
+    {
+        std::cerr << "Cannot open /proc to list processes\n";
+        return;
+    }
+
+    std::vector<unsigned long long> processIds;
+    while (const dirent* entry = readdir(directory))
+    {
+        const std::string name = entry->d_name;
+        const bool numeric = !name.empty() &&
+            std::all_of(name.begin(), name.end(), [](char character)
+                        { return character >= '0' && character <= '9'; });
+        if (numeric)
+        {
+            processIds.push_back(std::stoull(name));
+        }
+    }
+    closedir(directory);
+
+    std::sort(processIds.begin(), processIds.end());
+
+    std::cout << "Processes running: " << processIds.size() << '\n';
+    std::cout << "  PID       STATE         NAME\n";
+    for (const unsigned long long pid : processIds)
+    {
+        const std::string statusPath = "/proc/" + std::to_string(pid) + "/status";
+        const std::string name = readValueFromFile(statusPath, "Name");
+        const std::string state = readValueFromFile(statusPath, "State");
+
+        std::cout << "  " << std::left << std::setw(8) << pid
+                  << std::setw(13) << (state.empty() ? "?" : state)
+                  << (name.empty() ? "?" : name) << '\n';
+    }
+}
+
+} // namespace
+
+int main(int argc, char* argv[])
+{
+    const std::string path = (argc > 1) ? argv[1] : "/";
+
+    showCpu();
+    showMemory();
+    showOperatingSystem();
+    showStorage(path);
+    showProcesses();
+
+    return 0;
+}
